@@ -1,0 +1,303 @@
+#!/usr/bin/env ruby
+#
+# This command line app links Sonar, Crucible and Jenkins
+# Run `./sonar_blamethrower.rb help` for usage instructions
+
+SRC_PREFIX_REGEX = %r{code/(src|test)/}
+
+require 'rubygems'
+require 'commander/import'
+require 'rugged'
+require 'set'
+require 'net/http'
+require 'net/smtp'
+require 'json'
+require 'rexml/document'
+require 'cgi'
+
+$stdout.sync = true
+
+program :version, '0.0.1'
+program :description, 'Match Sonar issues to authors and reviews'
+
+command :review do |c|
+  c.syntax = 'review <REVIEW_ID>'
+  c.summary = 'List issues introduced in the specified review.'
+  c.description = 'List issues introduced in the specified review.'
+  c.example '1', "#{$0} review --project my:project CR-ABC-370"
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+
+  c.action do |args, options|
+    raise 'Expecting one review id' unless args.length == 1
+    raise '--project is required' unless options.project
+
+    # https://docs.atlassian.com/fisheye-crucible/latest/wadl/crucible.html#d2e933
+    # use XML as JSON parsing doesn't work that well here
+    uri = URI.parse("https://jira.softwire.com/fisheye/rest-service/reviews-v1/#{args.first}/details")
+    review_xml = Net::HTTP.start(uri.host,
+                                  uri.port,
+                                  :use_ssl => uri.scheme == 'https',
+                                  :verify_mode => OpenSSL::SSL::VERIFY_NONE) do |http|
+      req = Net::HTTP::Get.new uri.request_uri
+      req.basic_auth ENV['USERNAME'], get_password
+      response = http.request req
+
+      raise response.inspect unless response.code == "200"
+      response.body
+    end
+    review = REXML::Document.new review_xml
+
+    # we have to group the revisions by file, due to
+    # https://answers.atlassian.com/questions/235556/crucible-get-list-of-changesets-revisions-in-a-review/238685
+    revisions_by_filename = Hash.new{|h,k| h[k] = [] }
+
+    review.elements.each(
+      'detailedReviewData/reviewItems/reviewItem/expandedRevisions') do |rev|
+
+      filename = rev.elements['path'].text
+      revisions_by_filename[filename] << rev
+    end
+
+    commits = Set.new
+    revisions_by_filename.each do |filename, revisions|
+      if revisions.length == 1
+        commits << revisions.first.elements['revision'].text
+      else
+
+        # TODO: this doesn't work https://answers.atlassian.com/questions/235556/crucible-get-list-of-changesets-revisions-in-a-review/249721
+        # if 'Added' == revisions.first.elements['commitType'].text
+        #  # For a file which has been added then modified in the same reivew,
+        #  # all commits in the slider belong to the review.
+        #  puts "WARNING: '#{filename}' is both added and modified in this review."
+        #  puts "  Only the modifications will be shown by default. See [https://jira.atlassian.com/browse/CRUC-6671|CRUC-6671]"
+        #else
+
+        # Drop the first revision: it's Crucible adding the "before" rev to the slider
+        revisions.shift
+
+        hashes = revisions.map {|r| r.elements['revision'].text}
+        commits += hashes
+      end
+    end
+
+    puts "Warning: the logic to determine which commits are in which review is not always accurate,"
+    puts "especially if the review has lots of revisions, and certainly if any intermediate revisions"
+    puts "have been auto-included by Crucible."
+    puts "See https://answers.atlassian.com/questions/235556/crucible-get-list-of-changesets-revisions-in-a-review"
+    puts
+
+    puts "Found commits:\n  #{commits.to_a.join "\n  "}"
+
+    issues = []
+    each_issue_for_commits(options.project, commits) { |issue| issues << issue }
+
+    issues.sort! {|a,b| a['component'] <=> b['component'] }
+
+    puts "Found issues:"
+    issues.each do |issue|
+      url = "http://sonar.zoo.lan/issue/show/" + issue['key']
+      filename = issue['component'].gsub('.', '/').sub(/.*:/, '') + '.java'
+      puts "#{filename}:#{issue['line']} [sonar|#{url}]: #{issue['message']}"
+      puts
+    end
+  end
+end
+
+command :jenkins do |c|
+  c.syntax = 'jenkins'
+  c.summary = 'Run during a Jenkins build (after Sonar) to email authors about new issues.'
+  c.description = 'Run this command during a Jenkins build, and after the Sonar plugin has run. It will determine which changes are included in the current build, look up whether any new Sonar issues were introduced by those changes, and email the authors with the details.'
+  c.example '1', "#{$0} --project my:project jenkins"
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+
+  c.action do |args, options|
+    raise '--project is required' unless options.project
+
+    # Look up which commits are included in this build
+    commits = get_commit_list_for_current_jenkins_build
+
+    commits_by_author = Hash.new{|h,k| h[k] = []}
+    commits.each do |commit|
+      commits_by_author[get_author_email(commit)] << commit
+    end
+
+    commits_by_author.each do |author, commits|
+      email = <<END
+<html>
+<body>
+<h1>
+  Sonar issues introduced in Jenkins build
+  <a href="#{ENV['BUILD_URL']}">
+    #{ENV['JOB_NAME']} #{ENV['BUILD_NUMBER']}
+  </a>
+</h1>
+<p>You made the following commits which were included in this build:
+  <ul><li>#{commits.join('</li><li>')}</li></ul>
+</p>
+<p>The following issues were detected by Sonar:
+  <ul>
+END
+
+      issues_found = false
+      each_issue_for_commits(options.project, commits) do |issue|
+        url = "http://sonar.zoo.lan/issue/show/" + issue['key']
+        filename = issue['component'].gsub('.', '/').sub(/.*:/, '') + '.java'
+        message = html_escape(issue['message'])
+        email += "<li><a href=\"#{url}\">#{filename}:#{issue['line']}</a>: #{message}</li>"
+        issues_found = true
+      end
+
+      email += <<END
+  </ul>
+</p>
+<p>Please note that Sonar is just a tool
+and some of these issues may be false-positives.
+If you disagree with any of the issues raised by Sonar, please
+consider reconfiguring the rule set (email RTB about any changes)
+or adding an explicit ignore rule or a code comment.
+</p>
+<p>Only those issues which are attributed to lines of code added in the above
+commit(s) are included here. This may include pre-existing issues on
+code which you have modified, and it may exclude some issues you have
+introduced. Use your judgement.</p>
+</body>
+</html>
+END
+
+      if issues_found
+        send_email(
+                   author,
+                   "Sonar issues introduced in Jenkins build #{ENV['JOB_NAME']} #{ENV['BUILD_NUMBER']}",
+                   email)
+      end
+    end
+  end
+end
+
+command :commit do |c|
+  c.syntax = 'commit <hash>...'
+  c.summary = 'List issues introduced by the specified commit.'
+  c.description = 'List issues introduced by the specified commit.'
+  c.example '1', "#{$0} commit --project my:project 9bf5886 64a6004"
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+
+  c.action do |args, options|
+    raise '--project is required' unless options.project
+
+    each_issue_for_commits(options.project, args) do |issue|
+      url = "http://sonar.zoo.lan/issue/show/" + issue['key']
+      filename = issue['component']
+      puts "#{filename}:#{issue['line']} [sonar|#{url}]: #{issue['message']}"
+      puts
+    end
+  end
+end
+
+# When running inside a Jenkins build, this returns the hashes of all commits
+# included in the current build as a list of strings (may be empty).
+# See http://stackoverflow.com/questions/6260383/how-to-get-list-of-changed-files-since-last-build-in-jenkins-hudson
+def get_commit_list_for_current_jenkins_build
+  url = ENV['BUILD_URL'] + 'api/json/'
+  build_json = Net::HTTP.get_response(URI.parse(url)).body
+  build = JSON.parse(build_json)
+
+  commits = []
+  build['changeSet']['items'].each do |item|
+    commits << item['id']
+  end
+  commits
+end
+
+def get_repo
+  @repo ||= Rugged::Repository::new(Rugged::Repository::discover())
+end
+
+# Yields an issue object for each issue created in the given commits
+def each_issue_for_commits project_name, hashlist, &block
+  hashlist.each do |revhash|
+    repo = get_repo()
+
+    commit = repo.lookup(revhash)
+    diff = commit.parent.diff(commit)
+    diff.each_patch do |patch|
+
+      # Get the added lines
+      lines = Set.new
+      patch.each_hunk do |hunk|
+        hunk.each_line do |line|
+          if line.addition?
+            lines << line.new_lineno
+          end
+        end
+      end
+
+      # Get the current issues for the file
+      delta = patch.delta
+      filename = delta.new_file[:path]
+
+      sonar_resource_name = project_name + ':' +
+        filename.sub(SRC_PREFIX_REGEX, '') \
+        .sub(/.java$/, '') \
+        .gsub('/', '.')
+
+      # http://docs.codehaus.org/pages/viewpage.action?pageId=231080558#WebService/api/issues-GetaListofIssues
+      url = "http://sonar.zoo.lan:9000/api/issues/search?components=#{sonar_resource_name}"
+      issues_json = Net::HTTP.get_response(URI.parse(url)).body
+      all_issues = JSON.parse(issues_json)
+
+      new_issues = all_issues['issues'].select { |issue| lines.include? issue['line'] }
+
+      # print the result
+      new_issues.each &block
+    end
+  end
+end
+
+def get_author_email revhash
+  repo = get_repo()
+  commit = repo.lookup(revhash)
+  commit.author[:email]
+end
+
+class Rugged::Commit
+  def parent
+    ps = parents
+    raise "multiple parents" unless parents.count == 1
+    ps.first
+  end
+end
+
+def get_password(prompt="Enter Password")
+  # Highline doesn't work in cygwin bash
+  if ENV['SHELL']
+    puts prompt
+    password = $stdin.gets.chomp
+    puts "\033[2A"
+    puts ("*" * password.length) + "\r"
+    password
+  else
+    ask(prompt) {|q| q.echo = false}
+  end
+end
+
+def html_escape string
+  CGI.escapeHTML string
+end
+
+def send_email address, subject, body
+  from = 'jenkins-master@zoo.lan'
+
+  message = <<END
+From: #{from}
+To: #{address}
+MIME-Version: 1.0
+Content-type: text/html
+Subject: #{subject}
+
+#{body}
+END
+
+  Net::SMTP.start('smtp.zoo.lan') do |smtp|
+    smtp.send_message message, from, address
+  end
+end
