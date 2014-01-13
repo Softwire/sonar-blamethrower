@@ -95,7 +95,7 @@ https://answers.atlassian.com/questions/235556'
     puts
 
     puts "Found commits:"
-    print_commit_summary commits
+    commit_summaries_from_hashes(commits).each {|line| puts line}
     puts
 
     issues = []
@@ -143,6 +143,8 @@ otherwise Sonar won\'t have the correct details.'
     end
 
     commits_by_author.each do |author, commits|
+      commit_log = commit_summaries_from_hashes(commits)
+
       email = <<END
 <html>
 <body>
@@ -153,7 +155,8 @@ otherwise Sonar won\'t have the correct details.'
   </a>
 </h1>
 <p>You made the following commits which were included in this build:
-  <ul><li>#{commits.join('</li><li>')}</li></ul>
+  <ul>
+    <li>#{commit_log.join("</li>\n    <li>")}</li></ul>
 </p>
 <p>The following issues were detected by Sonar:
   <ul>
@@ -164,7 +167,7 @@ END
         url = "http://sonar.zoo.lan/issue/show/" + issue['key']
         filename = issue['component'].gsub('.', '/').sub(/.*:/, '') + '.java'
         message = html_escape(issue['message'])
-        email += "<li><a href=\"#{url}\">#{filename}:#{issue['line']}</a>: #{message}</li>"
+        email += "    <li><a href=\"#{url}\">#{filename}:#{issue['line']}</a>: #{message}</li>\n"
         issues_found = true
       end
 
@@ -186,10 +189,14 @@ introduced. Use your judgement.</p>
 END
 
       if issues_found
+        puts "Sonar issues were introduced by #{author}. Now sending the following email:\n"
+        puts email
         send_email(
                    author,
                    "Sonar issues introduced in Jenkins build #{ENV['JOB_NAME']} #{ENV['BUILD_NUMBER']}",
                    email)
+      else
+        puts "No Sonar issues were introduced by #{author}."
       end
     end
   end
@@ -230,7 +237,8 @@ end
 # included in the current build as a list of strings (may be empty).
 # See http://stackoverflow.com/questions/6260383/how-to-get-list-of-changed-files-since-last-build-in-jenkins-hudson
 def get_commit_list_for_current_jenkins_build
-  url = ENV['BUILD_URL'] + 'api/json/'
+  build_url = ENV['BUILD_URL'] or raise "Missing ENV var 'BUILD_URL'"
+  url = build_url + 'api/json/'
   build_json = Net::HTTP.get_response(URI.parse(url)).body
   build = JSON.parse(build_json)
 
@@ -335,17 +343,17 @@ END
   end
 end
 
-# Prints a short log for each commit hash
-def print_commit_summary commit_hashes
+# Creates a short log for each commit hash, and sorts them
+def commit_summaries_from_hashes commit_hashes
   repo = get_repo()
   commits = commit_hashes.map {|hash| repo.lookup(hash)}
   commits.sort! {|a,b| a.time <=> b.time }
 
   author_max_len = commits.map {|commit| commit.author[:name].length }.max
 
-  commits.each do |commit|
+  commits.map do |commit|
     message_first_line = commit.message[/.*/]
 
-    puts "#{commit.oid[0,7]} #{commit.author[:name].ljust(author_max_len)} #{message_first_line}"
+    "#{commit.oid[0,7]} #{commit.author[:name].ljust(author_max_len)} #{message_first_line}"
   end
 end
