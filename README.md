@@ -54,8 +54,6 @@ The script will return all issues which Sonar attributes to lines in the code wh
 
 If the commits are old, then some of their lines may have since been modified, so Sonar may have issues attributed to those lines which were not actually caused by those commits.
 
-I have noticed that Sonar is sometimes a little funny about which line number an issue belongs to. I think it's trying to track issues which move slightly when their line is moved by a change. This may sometimes result in incorrect results from the script.
-
 List issues introduced in the specified Crucible review.
 ------
 
