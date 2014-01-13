@@ -22,10 +22,18 @@ program :description, 'Match Sonar issues to authors and reviews'
 
 command :review do |c|
   c.syntax = 'review <REVIEW_ID>'
-  c.summary = 'List issues introduced in the specified review.'
-  c.description = 'List issues introduced in the specified review.'
+  c.summary = 'List issues introduced in the specified Crucible review.'
+  c.description = 'List issues introduced in the specified Crucible review.
+
+The script consults Crucible to establish which commits belong to the specified
+review (it will prompt you for your Crucible password), and then proceeds just
+as in the `commit` case. See the remarks on `help commit` for more.
+
+The logic to establish which commits belong to a review does not work all that
+well. See the extended discussion at
+https://answers.atlassian.com/questions/235556'
   c.example '1', "#{$0} review --project my:project CR-ABC-370"
-  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project" (listed on the main page for the project in Sonar)'
 
   c.action do |args, options|
     raise 'Expecting one review id' unless args.length == 1
@@ -108,9 +116,20 @@ end
 command :jenkins do |c|
   c.syntax = 'jenkins'
   c.summary = 'Run during a Jenkins build (after Sonar) to email authors about new issues.'
-  c.description = 'Run this command during a Jenkins build, and after the Sonar plugin has run. It will determine which changes are included in the current build, look up whether any new Sonar issues were introduced by those changes, and email the authors with the details.'
-  c.example '1', "#{$0} --project my:project jenkins"
-  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+  c.description = 'Run this command during a Jenkins build, and after the Sonar plugin has run.
+
+It will determine which changes are included in the current build, look up whether
+any new Sonar issues were introduced by those changes, and email the authors with
+the details.
+
+The script consults the Jenkins environment variables and XML API to establish
+which commits belong to the currently running build, and then proceeds just as in
+the `commit` case. See the remarks on `help commit` for more.
+
+You should run this command after the Sonar analysis step in your build process,
+otherwise Sonar won\'t have the correct details.'
+  c.example '1', "#{$0} jenkins --project my:project"
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project" (listed on the main page for the project in Sonar)'
 
   c.action do |args, options|
     raise '--project is required' unless options.project
@@ -179,9 +198,21 @@ end
 command :commit do |c|
   c.syntax = 'commit <hash>...'
   c.summary = 'List issues introduced by the specified commit.'
-  c.description = 'List issues introduced by the specified commit.'
+  c.description = 'List issues introduced by the specified commit.
+
+The script will return all issues which Sonar attributes to lines in the code
+which `git blame` attributes to the specified commit(s).
+
+If the commits are old, then some of their lines may have since been modified, so
+Sonar may have issues attributed to those lines which were not actually caused by
+those commits.
+
+I have noticed that Sonar is sometimes a little funny about which line number an
+issue belongs to. I think it\'s trying to track issues which move slightly when
+their line is moved by a change. This may sometimes result in incorrect results
+from the script.'
   c.example '1', "#{$0} commit --project my:project 9bf5886 64a6004"
-  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project"'
+  c.option '--project STRING', String, 'The Sonar project key, e.g. "my:project" (listed on the main page for the project in Sonar)'
 
   c.action do |args, options|
     raise '--project is required' unless options.project
