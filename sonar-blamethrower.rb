@@ -86,7 +86,9 @@ command :review do |c|
     puts "See https://answers.atlassian.com/questions/235556/crucible-get-list-of-changesets-revisions-in-a-review"
     puts
 
-    puts "Found commits:\n  #{commits.to_a.join "\n  "}"
+    puts "Found commits:"
+    print_commit_summary commits
+    puts
 
     issues = []
     each_issue_for_commits(options.project, commits) { |issue| issues << issue }
@@ -299,5 +301,20 @@ END
 
   Net::SMTP.start('smtp.zoo.lan') do |smtp|
     smtp.send_message message, from, address
+  end
+end
+
+# Prints a short log for each commit hash
+def print_commit_summary commit_hashes
+  repo = get_repo()
+  commits = commit_hashes.map {|hash| repo.lookup(hash)}
+  commits.sort! {|a,b| a.time <=> b.time }
+
+  author_max_len = commits.map {|commit| commit.author[:name].length }.max
+
+  commits.each do |commit|
+    message_first_line = commit.message[/.*/]
+
+    puts "#{commit.oid[0,7]} #{commit.author[:name].ljust(author_max_len)} #{message_first_line}"
   end
 end
