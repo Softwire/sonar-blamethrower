@@ -20,6 +20,8 @@ $stdout.sync = true
 program :version, '0.0.1'
 program :description, 'Match Sonar issues to authors and reviews'
 
+global_option('--debug', 'Turn on extra logging') { @debug = true }
+
 command :review do |c|
   c.syntax = 'review <REVIEW_ID>'
   c.summary = 'List issues introduced in the specified Crucible review.'
@@ -156,7 +158,8 @@ otherwise Sonar won\'t have the correct details.'
 </h1>
 <p>You made the following commits which were included in this build:
   <ul>
-    <li>#{commit_log.join("</li>\n    <li>")}</li></ul>
+    <li>#{commit_log.join("</li>\n    <li>")}</li>
+  </ul>
 </p>
 <p>The following issues were detected by Sonar:
   <ul>
@@ -258,6 +261,8 @@ def each_issue_for_commits project_name, hashlist, &block
   hashlist.each do |revhash|
     repo = get_repo()
 
+    debug "Fetching issues for #{revhash}"
+
     commit = repo.lookup(revhash)
     diff = commit.parent.diff(commit)
     diff.each_patch do |patch|
@@ -276,6 +281,8 @@ def each_issue_for_commits project_name, hashlist, &block
       delta = patch.delta
       filename = delta.new_file[:path]
 
+      debug "Fetching issues for file '#{filename}'"
+
       sonar_resource_name = project_name + ':' +
         filename.sub(SRC_PREFIX_REGEX, '') \
         .sub(/.java$/, '') \
@@ -283,10 +290,17 @@ def each_issue_for_commits project_name, hashlist, &block
 
       # http://docs.codehaus.org/pages/viewpage.action?pageId=231080558#WebService/api/issues-GetaListofIssues
       url = "http://sonar.zoo.lan:9000/api/issues/search?components=#{sonar_resource_name}"
+      # exclude already fixed issues:
+      url += "&statuses=OPEN,REOPENED,CONFIRMED"
+      debug "Fetching JSON from '#{url}'"
       issues_json = Net::HTTP.get_response(URI.parse(url)).body
       all_issues = JSON.parse(issues_json)
 
-      new_issues = all_issues['issues'].select { |issue| lines.include? issue['line'] }
+      new_issues = all_issues['issues'].select do |issue|
+        included = lines.include? issue['line']
+        debug "#{issue} is #{included ? 'NOT ' : ''}included"
+        included
+      end
 
       # print the result
       new_issues.each &block
@@ -356,4 +370,8 @@ def commit_summaries_from_hashes commit_hashes
 
     "#{commit.oid[0,7]} #{commit.author[:name].ljust(author_max_len)} #{message_first_line}"
   end
+end
+
+def debug msg
+  puts "DEBUG: #{msg}" if @debug
 end
